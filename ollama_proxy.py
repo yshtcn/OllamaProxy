@@ -190,11 +190,14 @@ async def proxy(request: Request, path: str):
                         url=target_url,
                         json=request_body,
                         headers=headers,
-                        timeout=timeout
+                        timeout=None  # 流式传输不设置整体超时
                     ) as response:
                         async for line in response.aiter_lines():
                             if line.strip():  # 忽略空行
                                 yield line.encode('utf-8') + b'\n'
+                except httpx.TimeoutError as e:
+                    logger.error(f"流式传输超时: {str(e)}")
+                    raise
                 except Exception as e:
                     logger.error(f"流式传输时发生错误: {str(e)}")
                     raise
