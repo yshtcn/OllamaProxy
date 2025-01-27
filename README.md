@@ -43,11 +43,11 @@ Ollama Proxy 是一个为 Ollama 服务设计的智能代理服务器，它提�
 
 ### 3. 模型列表缓存
 - 缓存 `/api/tags` 接口返回的模型列表
-- 缓存有效期为30分钟
-- 当主服务不可用时返回缓存数据
+- 可配置缓存有效期，默认为1440分钟（1天）
+- 当主服务不可用时返回缓存数据，确保客户端始终可以获取模型列表
 
 ### 4. 健康检查
-- 提供 `/health` 端点进行健康状态检查
+- 提供 `  ` 端点进行健康状态检查
 - Docker 容器集成了健康检查配置
 
 ## 配置参数
@@ -62,6 +62,7 @@ Ollama Proxy 是一个为 Ollama 服务设计的智能代理服务器，它提�
 | `--model-timeout` | `MODEL_TIMEOUT_SECONDS` | 模型推理请求超时时间(秒) | 30 |
 | `--port` | `PORT` | 代理服务器端口 | 11434 |
 | `--wake-interval` | `WAKE_INTERVAL` | 唤醒间隔时间(分钟) | 10 |
+| `--cache-duration` | `CACHE_DURATION` | 模型列表缓存有效期(分钟) | 1440 |
 
 ## 部署方式
 
@@ -81,6 +82,9 @@ docker run -d \
   -e OLLAMA_URL=http://localhost:11434 \
   -e WAKE_URL=http://localhost:11434/api/generate \
   -e TIMEOUT_SECONDS=10 \
+  -e MODEL_TIMEOUT_SECONDS=30 \
+  -e WAKE_INTERVAL=10 \
+  -e CACHE_DURATION=1440 \
   -e PORT=11434 \
   yshtcn/ollama-proxy:latest
 ```
@@ -98,6 +102,9 @@ python ollama_proxy.py \
   --ollama-url http://localhost:11434 \
   --wake-url http://localhost:11434/api/generate \
   --timeout 10 \
+  --model-timeout 30 \
+  --wake-interval 10 \
+  --cache-duration 1440 \
   --port 11434
 ```
 
