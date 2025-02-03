@@ -14,19 +14,21 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # 解析命令行参数
-parser = argparse.ArgumentParser(description='Ollama代理服务器')
+parser = argparse.ArgumentParser(description='代理服务器')
 parser.add_argument('--ollama-url', help='Ollama服务器URL')
-parser.add_argument('--wake-url', help='唤醒服务器URL')
+parser.add_argument('--lms-url', help='LM Studio服务器URL')
+parser.add_argument('--wake-url', help='唤醒服务器URL（可选）')
 parser.add_argument('--timeout', type=int, help='简单请求的超时时间(秒)')
 parser.add_argument('--model-timeout', type=int, help='模型推理请求的超时时间(秒)')
 parser.add_argument('--port', type=int, help='代理服务器端口')
-parser.add_argument('--wake-interval', type=int, default=10, help='唤醒间隔时间(分钟)')
+parser.add_argument('--wake-interval', type=int, default=10, help='唤醒间隔时间(分钟)，仅在配置wake-url时有效')
 parser.add_argument('--cache-duration', type=int, help='模型列表缓存有效期(分钟)，默认1440分钟(1天)')
 
 args = parser.parse_args()
 
 # 配置常量，优先使用环境变量，其次使用命令行参数
 OLLAMA_URL = os.getenv('OLLAMA_URL') or args.ollama_url
+LMS_URL = os.getenv('LMS_URL') or args.lms_url
 WAKE_URL = os.getenv('WAKE_URL') or args.wake_url
 TIMEOUT_SECONDS = os.getenv('TIMEOUT_SECONDS') or args.timeout
 MODEL_TIMEOUT_SECONDS = int(os.getenv('MODEL_TIMEOUT_SECONDS') or args.model_timeout or 30)  # 默认30秒
@@ -34,12 +36,28 @@ PORT = os.getenv('PORT') or args.port
 WAKE_INTERVAL = int(os.getenv('WAKE_INTERVAL') or args.wake_interval)
 CACHE_DURATION = int(os.getenv('CACHE_DURATION') or args.cache_duration or 1440)  # 默认1天
 
-# 检查必要参数
+# 检查URL配置
+if OLLAMA_URL and LMS_URL:
+    logger.error("不能同时配置 OLLAMA_URL 和 LMS_URL，请只选择其中一个")
+    sys.exit(1)
+elif not (OLLAMA_URL or LMS_URL):
+    logger.error("必须配置 OLLAMA_URL 或 LMS_URL 其中之一")
+    sys.exit(1)
+
+# 设置服务器类型和基础URL
+if OLLAMA_URL:
+    server_type = 'ollama'
+    BASE_URL = OLLAMA_URL
+    MODEL_LIST_PATH = 'api/tags'
+    GENERATE_ENDPOINTS = ["api/generate", "api/chat"]
+else:
+    server_type = 'lmstudio'
+    BASE_URL = LMS_URL
+    MODEL_LIST_PATH = 'v1/models'
+    GENERATE_ENDPOINTS = ["v1/chat/completions"]
+
+# 检查其他必要参数
 missing_params = []
-if not OLLAMA_URL:
-    missing_params.append("OLLAMA_URL")
-if not WAKE_URL:
-    missing_params.append("WAKE_URL")
 if not TIMEOUT_SECONDS:
     missing_params.append("TIMEOUT_SECONDS")
 if not PORT:
@@ -67,13 +85,19 @@ models_cache_time = None
 
 async def should_wake():
     """检查是否需要发送唤醒请求"""
+    if not WAKE_URL:  # 如果没有配置WAKE_URL，永远不需要唤醒
+        return False
+    
     global last_wake_time
     if last_wake_time is None:
         return True
     return datetime.now() - last_wake_time > timedelta(minutes=WAKE_INTERVAL)
 
 async def wake_ollama():
-    """唤醒 Ollama 服务器"""
+    """唤醒服务器"""
+    if not WAKE_URL:  # 如果没有配置WAKE_URL，直接返回
+        return
+    
     global last_wake_time
     try:
         async with httpx.AsyncClient() as client:
@@ -99,16 +123,6 @@ async def update_models_cache(data):
     models_cache_time = datetime.now()
     logger.info("模型列表缓存已更新")
 
-# 输出当前配置
-logger.info(f"使用配置:")
-logger.info(f"OLLAMA_URL: {OLLAMA_URL}")
-logger.info(f"WAKE_URL: {WAKE_URL}")
-logger.info(f"TIMEOUT_SECONDS: {TIMEOUT_SECONDS}")
-logger.info(f"MODEL_TIMEOUT_SECONDS: {MODEL_TIMEOUT_SECONDS}")
-logger.info(f"PORT: {PORT}")
-logger.info(f"WAKE_INTERVAL: {WAKE_INTERVAL} minutes")
-logger.info(f"CACHE_DURATION: {CACHE_DURATION} minutes")
-
 app = FastAPI()
 
 @app.get("/health")
@@ -124,7 +138,7 @@ async def list_models():
         
         async with httpx.AsyncClient() as client:
             response = await client.get(
-                f"{OLLAMA_URL}/api/tags",
+                f"{BASE_URL}/{MODEL_LIST_PATH}",
                 timeout=TIMEOUT_SECONDS  # 使用较短的超时时间
             )
             # 更新缓存并返回最新数据
@@ -158,12 +172,12 @@ async def proxy(request: Request, path: str):
         return await health_check()
     
     # 其他请求的处理逻辑
-    if await should_wake():
+    if WAKE_URL and await should_wake():
         logger.info("距离上次唤醒已超过设定时间，发送预防性唤醒请求")
         await wake_ollama()
     
     try:
-        target_url = f"{OLLAMA_URL}/{path}"
+        target_url = f"{BASE_URL}/{path}"
         headers = dict(request.headers)
         headers.pop('host', None)
         headers.pop('connection', None)
@@ -172,10 +186,10 @@ async def proxy(request: Request, path: str):
         headers.pop('transfer-encoding', None)
         
         # 根据请求类型选择不同的超时时间
-        timeout = TIMEOUT_SECONDS if path == "api/tags" else MODEL_TIMEOUT_SECONDS
+        timeout = TIMEOUT_SECONDS if path == MODEL_LIST_PATH else MODEL_TIMEOUT_SECONDS
 
         # 检查是否为生成相关的端点
-        is_generate_endpoint = path in ["api/generate", "api/chat"]
+        is_generate_endpoint = path in GENERATE_ENDPOINTS
         
         if is_generate_endpoint and request.method == "POST":
             request_body = await request.json()
@@ -223,7 +237,7 @@ async def proxy(request: Request, path: str):
                 )
                 
                 # 如果是标签列表请求且成功，更新缓存
-                if path == "api/tags" and request.method == "GET" and response.status_code == 200:
+                if path == MODEL_LIST_PATH and request.method == "GET" and response.status_code == 200:
                     await update_models_cache(response.json())
                 
                 return Response(
@@ -233,25 +247,31 @@ async def proxy(request: Request, path: str):
                 )
         
     except httpx.TimeoutException:
-        logger.warning("Ollama服务器超时，发送唤醒请求")
-        # 如果是标签列表请求，尝试返回缓存
-        if path == "api/tags" and request.method == "GET":
-            cached_models = await get_models_from_cache()
-            if cached_models is not None:
-                logger.info("返回缓存的标签列表")
-                return JSONResponse(content=cached_models)
-        
-        # 直接异步发送唤醒请求，不等待结果
-        asyncio.create_task(wake_ollama())
+        error_msg = "服务器超时"
+        if WAKE_URL:
+            error_msg += "，正在尝试唤醒"
+            logger.warning(f"{error_msg}")
+            # 如果是模型列表请求，尝试返回缓存
+            if path == MODEL_LIST_PATH and request.method == "GET":
+                cached_models = await get_models_from_cache()
+                if cached_models is not None:
+                    logger.info("返回缓存的模型列表")
+                    return JSONResponse(content=cached_models)
+            
+            # 直接异步发送唤醒请求，不等待结果
+            asyncio.create_task(wake_ollama())
+        else:
+            logger.warning(error_msg)
+            
         return JSONResponse(
             status_code=503,
-            content={"message": "服务器正在唤醒中，请稍后重试"}
+            content={"message": f"{error_msg}，请稍后重试"}
         )
     
     except httpx.RequestError as e:
         logger.error(f"请求错误: {str(e)}")
         # 如果是标签列表请求，尝试返回缓存
-        if path == "api/tags" and request.method == "GET":
+        if path == MODEL_LIST_PATH and request.method == "GET":
             cached_models = await get_models_from_cache()
             if cached_models is not None:
                 logger.info("返回缓存的标签列表")
@@ -259,7 +279,7 @@ async def proxy(request: Request, path: str):
                 
         return JSONResponse(
             status_code=502,
-            content={"message": f"无法连接到Ollama服务器: {str(e)}"}
+            content={"message": f"无法连接到服务器: {str(e)}"}
         )
             
     except Exception as e:
@@ -268,6 +288,20 @@ async def proxy(request: Request, path: str):
             status_code=500,
             content={"message": f"代理请求失败: {str(e)}"}
         )
+
+# 输出当前配置
+logger.info(f"使用配置:")
+logger.info(f"服务器类型: {server_type}")
+logger.info(f"BASE_URL: {BASE_URL}")
+if WAKE_URL:
+    logger.info(f"WAKE_URL: {WAKE_URL}")
+    logger.info(f"WAKE_INTERVAL: {WAKE_INTERVAL} minutes")
+else:
+    logger.info("未配置唤醒功能")
+logger.info(f"TIMEOUT_SECONDS: {TIMEOUT_SECONDS}")
+logger.info(f"MODEL_TIMEOUT_SECONDS: {MODEL_TIMEOUT_SECONDS}")
+logger.info(f"PORT: {PORT}")
+logger.info(f"CACHE_DURATION: {CACHE_DURATION} minutes")
 
 if __name__ == "__main__":
     import uvicorn
